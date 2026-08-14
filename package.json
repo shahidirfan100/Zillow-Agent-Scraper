@@ -6,6 +6,7 @@
     "dependencies": {
         "apify": "^3.7.2",
         "crawlee": "^3.17.0",
+        "impit": "^0.14.2",
         "patchright": "^1.60.0"
     },
     "devDependencies": {

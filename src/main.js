@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
+import { Impit } from 'impit';
 import { chromium } from 'patchright';
 
 const ZILLOW_BASE_URL = 'https://www.zillow.com';
@@ -9,9 +10,13 @@ const TRACKER_RE =
     /google-analytics|googletagmanager|doubleclick|bat\.bing|scorecardresearch|adscores|kargo|amazon-adsystem|facebook\.com\/tr/i;
 
 const MAX_SESSION_ROTATIONS = 2;
-const MAX_PROFILE_RETRIES = 3;
-const HYDRATION_WAIT_MS = 12000;
+// Profile pages are optional enrichment. Keep a challenged detail request from
+// holding the whole result set open, especially with residential proxies.
+const DETAIL_CONCURRENCY = 4;
+const HYDRATION_WAIT_MS = 9000;
+const HYDRATION_POLL_MS = 500;
 const HTTP_FALLBACK_TIMEOUT_MS = 20000;
+const PROFILE_HTTP_TIMEOUT_MS = 5000;
 
 const sleep = (ms) =>
     new Promise((resolve) => {
@@ -63,18 +68,23 @@ class StealthBrowser {
         this.page = pages.length > 0 ? pages[0] : await this.context.newPage();
     }
 
-    async goto(url) {
+    async goto(url, options = {}, targetPage = this.page) {
+        const navigationTimeoutMs = options.navigationTimeoutMs ?? 60000;
+        const hydrationWaitMs = options.hydrationWaitMs ?? HYDRATION_WAIT_MS;
         try {
-            await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await targetPage.goto(url, {
+                waitUntil: options.waitUntil ?? 'domcontentloaded',
+                timeout: navigationTimeoutMs,
+            });
         } catch {
             // navigation timeout or aborted reload; DOM extraction below still applies
         }
 
-        const deadline = Date.now() + HYDRATION_WAIT_MS;
+        const deadline = Date.now() + hydrationWaitMs;
         while (Date.now() < deadline) {
             let state;
             try {
-                state = await this.page.evaluate(() => {
+                state = await targetPage.evaluate(() => {
                     const script = document.querySelector('script#__NEXT_DATA__');
                     const bodyText = document.body ? document.body.innerText : '';
                     return {
@@ -88,17 +98,17 @@ class StealthBrowser {
                     };
                 });
             } catch {
-                await sleep(1500);
+                await sleep(HYDRATION_POLL_MS);
                 continue;
             }
             if (state.hasJson && !state.blocked) return state;
             if (state.blocked) return state;
-            await sleep(1500);
+            await sleep(HYDRATION_POLL_MS);
         }
 
         let finalState;
         try {
-            finalState = await this.page.evaluate(() => {
+            finalState = await targetPage.evaluate(() => {
                 const script = document.querySelector('script#__NEXT_DATA__');
                 return {
                     hasJson: Boolean(script?.textContent),
@@ -113,8 +123,8 @@ class StealthBrowser {
         return finalState;
     }
 
-    async fetch(url) {
-        const state = await this.goto(url);
+    async fetch(url, options = {}, targetPage = this.page) {
+        const state = await this.goto(url, options, targetPage);
         if (state.blocked) {
             throw new Error(`Zillow blocked the browser request for ${url}`);
         }
@@ -278,10 +288,12 @@ const HTTP_HYDRATION_PROFILES = [
     },
 ];
 
-async function fetchHydrationOverHttp(url) {
-    for (const profile of HTTP_HYDRATION_PROFILES) {
+async function fetchHydrationOverHttp(url, options = {}) {
+    const timeoutMs = options.timeoutMs ?? HTTP_FALLBACK_TIMEOUT_MS;
+    const profiles = options.profiles ?? HTTP_HYDRATION_PROFILES;
+    for (const profile of profiles) {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), HTTP_FALLBACK_TIMEOUT_MS);
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
         try {
             const response = await fetch(url, {
                 headers: profile.headers,
@@ -293,14 +305,43 @@ async function fetchHydrationOverHttp(url) {
                 log.info(`HTTP hydration fallback returned Zillow JSON with ${profile.name}.`);
                 return extractNextDataFromHtml(html, url);
             }
-            log.warning(`HTTP hydration fallback ${profile.name} returned ${response.status} without Zillow JSON.`);
+            log.debug(`HTTP hydration fallback ${profile.name} returned ${response.status} without Zillow JSON.`);
         } catch (error) {
-            log.warning(`HTTP hydration fallback ${profile.name} failed: ${error.message}`);
+            log.debug(`HTTP hydration fallback ${profile.name} failed: ${error.message}`);
         } finally {
             clearTimeout(timeout);
         }
     }
     throw new Error(`HTTP hydration fallback failed for ${url}`);
+}
+
+async function fetchProfileHydrationWithImpit(client, url) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), PROFILE_HTTP_TIMEOUT_MS);
+    try {
+        const response = await client.fetch(url, { redirect: 'follow', signal: controller.signal });
+        if (!response.ok) throw new Error(`Impit returned HTTP ${response.status} for ${url}`);
+        return extractNextDataFromHtml(await response.text(), url);
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+function createImpitClient(proxyUrl) {
+    return new Impit({
+        browser: 'chrome',
+        ignoreTlsErrors: true,
+        ...(proxyUrl ? { proxyUrl } : {}),
+    });
+}
+
+async function createProfileClientPool(proxyConfiguration, size) {
+    const clients = [];
+    for (let index = 0; index < size; index++) {
+        const proxyUrl = proxyConfiguration ? await getProxyUrl(proxyConfiguration) : undefined;
+        clients.push(createImpitClient(proxyUrl));
+    }
+    return clients;
 }
 
 function getSearchResults(nextData) {
@@ -398,6 +439,44 @@ function countItems(value, key) {
     return undefined;
 }
 
+function mapProfileDetails(nextData) {
+    const pageProps = nextData?.props?.pageProps || {};
+    const user = pageProps.displayUser || {};
+    const info = pageProps.professionalInformation || {};
+    const team = pageProps.teamDisplayInformation || {};
+    const ratings = user.ratings || {};
+    const phoneNumbers = user.phoneNumbers || {};
+
+    return cleanRecord({
+        profile_name: user.name || user.screenName,
+        email: user.email,
+        phone_cell: phoneNumbers.cell,
+        phone_office: phoneNumbers.office,
+        phone_brokerage: phoneNumbers.brokerage,
+        business_address: formatAddress(user.businessAddress),
+        business_city: user.businessAddress?.city,
+        business_state: user.businessAddress?.state,
+        business_postal_code: user.businessAddress?.postalCode,
+        profile_types: normalizeStringArray(user.profileTypes),
+        profile_photo_url: absoluteZillowUrl(user.profilePhotoSrc),
+        profile_review_average: normalizeNumber(ratings.average),
+        profile_review_count: normalizeNumber(ratings.count),
+        about: info.aboutMe || info.description || pageProps.getToKnowMe?.description,
+        specialties: normalizeStringArray(info.specialties),
+        languages: normalizeStringArray(info.languages),
+        websites: normalizeStringArray(info.websites),
+        agent_licenses: mapLicenses(pageProps.agentLicenses),
+        other_licenses: mapLicenses(pageProps.otherLicenses),
+        service_areas: mapServiceAreas(pageProps.serviceAreas),
+        for_sale_listing_count: countItems(pageProps.forSaleListings, 'listings'),
+        for_rent_listing_count: countItems(pageProps.forRentListings, 'listings'),
+        past_sales_count: countItems(pageProps.pastSales, 'sales'),
+        review_count_detailed: countItems(pageProps.reviewsData, 'reviews'),
+        team_name: team.teamName,
+        team_members_count: countItems(team.teamMembers, 'members'),
+    });
+}
+
 async function getActorInput() {
     const input = (await Actor.getInput()) || {};
     if (getInputUrls(input).length > 0 || input.keyword || input.location || input.search_location) return input;
@@ -464,13 +543,13 @@ async function warmupBrowser(browser) {
     }
 }
 
-async function fetchWithRetry(browser, url, proxyConfiguration, rotations, label) {
+async function fetchWithRetry(browser, url, proxyConfiguration, rotations, label, fetchOptions, targetPage) {
     let activeBrowser = browser;
     let directAttempted = !proxyConfiguration;
 
     for (let attempt = 1; attempt <= rotations; attempt++) {
         try {
-            const jsonText = await activeBrowser.fetch(url);
+            const jsonText = await activeBrowser.fetch(url, fetchOptions, targetPage);
             return { browser: activeBrowser, jsonText };
         } catch (error) {
             log.warning(`${label} attempt ${attempt}/${rotations} failed for ${url}: ${error.message}`);
@@ -492,62 +571,54 @@ async function fetchWithRetry(browser, url, proxyConfiguration, rotations, label
     throw new Error(`Could not fetch ${url} after ${rotations} rotations.`);
 }
 
-async function fetchProfileDetails(browser, profileUrl, proxyConfiguration) {
-    if (!profileUrl) return { browser, details: {} };
+async function fetchProfileDetails(browser, profileUrl, profileClients, primaryClientIndex) {
+    if (!profileUrl) return { browser, details: {}, failed: false };
 
-    let activeBrowser = browser;
-    try {
-        const result = await fetchWithRetry(
-            activeBrowser,
-            profileUrl,
-            proxyConfiguration,
-            MAX_PROFILE_RETRIES,
-            'Profile fetch',
-        );
-        activeBrowser = result.browser;
-        const nextData = parsePayload(result.jsonText, profileUrl);
-        const pageProps = nextData?.props?.pageProps || {};
-        const user = pageProps.displayUser || {};
-        const info = pageProps.professionalInformation || {};
-        const team = pageProps.teamDisplayInformation || {};
-        const ratings = user.ratings || {};
-        const phoneNumbers = user.phoneNumbers || {};
-
-        return {
-            browser: result.browser,
-            details: cleanRecord({
-                profile_name: user.name || user.screenName,
-                email: user.email,
-                phone_cell: phoneNumbers.cell,
-                phone_office: phoneNumbers.office,
-                phone_brokerage: phoneNumbers.brokerage,
-                business_address: formatAddress(user.businessAddress),
-                business_city: user.businessAddress?.city,
-                business_state: user.businessAddress?.state,
-                business_postal_code: user.businessAddress?.postalCode,
-                profile_types: normalizeStringArray(user.profileTypes),
-                profile_photo_url: absoluteZillowUrl(user.profilePhotoSrc),
-                profile_review_average: normalizeNumber(ratings.average),
-                profile_review_count: normalizeNumber(ratings.count),
-                about: info.aboutMe || info.description || pageProps.getToKnowMe?.description,
-                specialties: normalizeStringArray(info.specialties),
-                languages: normalizeStringArray(info.languages),
-                websites: normalizeStringArray(info.websites),
-                agent_licenses: mapLicenses(pageProps.agentLicenses),
-                other_licenses: mapLicenses(pageProps.otherLicenses),
-                service_areas: mapServiceAreas(pageProps.serviceAreas),
-                for_sale_listing_count: countItems(pageProps.forSaleListings, 'listings'),
-                for_rent_listing_count: countItems(pageProps.forRentListings, 'listings'),
-                past_sales_count: countItems(pageProps.pastSales, 'sales'),
-                review_count_detailed: countItems(pageProps.reviewsData, 'reviews'),
-                team_name: team.teamName,
-                team_members_count: countItems(team.teamMembers, 'members'),
-            }),
-        };
-    } catch (error) {
-        log.warning(`Profile enrichment failed for ${profileUrl}: ${error.message}`);
-        return { browser: activeBrowser, details: {} };
+    const clientCount = profileClients.length;
+    const clientIndexes = Array.from({ length: clientCount }, (_, offset) =>
+        (primaryClientIndex + offset) % clientCount,
+    );
+    for (const clientIndex of clientIndexes) {
+        try {
+            const jsonText = await fetchProfileHydrationWithImpit(profileClients[clientIndex], profileUrl);
+            return {
+                browser,
+                failed: false,
+                details: mapProfileDetails(parsePayload(jsonText, profileUrl)),
+            };
+        } catch {
+            // Try the next already-created session without creating a client per request.
+        }
     }
+
+    return { browser, details: {}, failed: true };
+}
+
+async function enrichProfilesInParallel(browser, pendingProfiles, profileClients, concurrency) {
+    const workerCount = Math.min(concurrency, pendingProfiles.length);
+    const results = new Array(pendingProfiles.length);
+    let nextIndex = 0;
+
+    const worker = async (workerIndex) => {
+        while (true) {
+            const index = nextIndex;
+            nextIndex += 1;
+            if (index >= pendingProfiles.length) return;
+
+            const pending = pendingProfiles[index];
+            const detailResult = await fetchProfileDetails(
+                browser,
+                pending.profileUrl,
+                profileClients,
+                workerIndex,
+            );
+            results[index] = { ...pending, ...detailResult };
+        }
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, (_, workerIndex) => worker(workerIndex)));
+
+    return { results };
 }
 
 async function main() {
@@ -566,6 +637,7 @@ async function main() {
 
     const proxyConfiguration = await createProxyConfiguration(input.proxyConfiguration);
     const proxyUrl = await getProxyUrl(proxyConfiguration);
+    const profileClient = createImpitClient();
 
     if (proxyConfiguration && !proxyUrl) {
         log.error(
@@ -582,9 +654,11 @@ async function main() {
     let pagesFetched = 0;
     let stopReason = 'result limit reached';
     let consecutiveEmptyPages = 0;
+    let profileDetailsFetched = 0;
+    let profileDetailsUnavailable = 0;
 
     log.info(
-        `Starting Zillow agent scrape | searches=${baseUrls.length} | target=${resultsWanted} | max_pages=${maxPages}${proxyUrl ? ' | proxy=enabled' : ''}`,
+        `Starting Zillow agent scrape | searches=${baseUrls.length} | target=${resultsWanted} | max_pages=${maxPages} | details=${Boolean(collectDetails)}${proxyUrl ? ' | proxy=enabled' : ''}`,
     );
 
     for (const baseUrl of baseUrls) {
@@ -607,13 +681,19 @@ async function main() {
                     nextData = parsePayload(fallbackPayload, sourceUrl);
                     log.info(`Using HTTP hydration fallback for page ${page}.`);
                 } catch (fallbackError) {
-                    const combinedError = `${error.message}; ${fallbackError.message}`;
-                    if (saved > 0) {
-                        stopReason = `stopped at page ${page}: ${combinedError}`;
-                        log.warning(stopReason);
-                        break;
+                    try {
+                        const impitPayload = await fetchProfileHydrationWithImpit(profileClient, sourceUrl);
+                        nextData = parsePayload(impitPayload, sourceUrl);
+                        log.info(`Using Impit hydration fallback for page ${page}.`);
+                    } catch (impitError) {
+                        const combinedError = `${error.message}; ${fallbackError.message}; ${impitError.message}`;
+                        if (saved > 0) {
+                            stopReason = `stopped at page ${page}: ${combinedError}`;
+                            log.warning(stopReason);
+                            break;
+                        }
+                        throw new Error(combinedError);
                     }
-                    throw new Error(combinedError);
                 }
             }
 
@@ -641,6 +721,7 @@ async function main() {
             };
             const batch = [];
 
+            const pendingProfiles = [];
             for (const card of cards) {
                 const profileUrl = absoluteZillowUrl(card.cardActionLink);
                 const key = card.encodedZuid || profileUrl || `${card.cardTitle}:${card.secondaryCardTitle}`;
@@ -648,15 +729,30 @@ async function main() {
                 seen.add(key);
 
                 const baseRecord = mapSearchCard(card, context);
-                if (collectDetails) {
-                    const detailResult = await fetchProfileDetails(browser, profileUrl, proxyConfiguration);
-                    browser = detailResult.browser;
-                    batch.push(cleanRecord({ ...baseRecord, ...detailResult.details }));
-                } else {
-                    batch.push(baseRecord);
-                }
+                pendingProfiles.push({ baseRecord, profileUrl });
 
-                if (saved + batch.length >= resultsWanted) break;
+                if (saved + pendingProfiles.length >= resultsWanted) break;
+            }
+
+            if (collectDetails && pendingProfiles.length) {
+                const profileClients = await createProfileClientPool(
+                    proxyConfiguration,
+                    Math.min(DETAIL_CONCURRENCY, pendingProfiles.length),
+                );
+                profileClients.push(profileClient);
+                const detailBatch = await enrichProfilesInParallel(
+                    browser,
+                    pendingProfiles,
+                    profileClients,
+                    DETAIL_CONCURRENCY,
+                );
+                for (const item of detailBatch.results) {
+                    if (item.failed) profileDetailsUnavailable += 1;
+                    else profileDetailsFetched += 1;
+                    batch.push(cleanRecord({ ...item.baseRecord, ...item.details }));
+                }
+            } else {
+                batch.push(...pendingProfiles.map(({ baseRecord }) => baseRecord));
             }
 
             if (batch.length) {
@@ -674,7 +770,7 @@ async function main() {
             }
 
             if (page < maxPages && saved < resultsWanted) {
-                await sleep(800 + Math.round(Math.random() * 1200));
+                await sleep(300 + Math.round(Math.random() * 500));
             }
         }
 
@@ -685,7 +781,10 @@ async function main() {
         stopReason = 'all searches completed';
     }
 
-    log.info(`Done | saved=${saved} | pages=${pagesFetched} | stop_reason=${stopReason}`);
+    const detailSummary = collectDetails
+        ? ` | details_fetched=${profileDetailsFetched} | details_unavailable=${profileDetailsUnavailable}`
+        : '';
+    log.info(`Done | saved=${saved} | pages=${pagesFetched}${detailSummary} | stop_reason=${stopReason}`);
 
     if (browser) await browser.close().catch(() => {});
 }
