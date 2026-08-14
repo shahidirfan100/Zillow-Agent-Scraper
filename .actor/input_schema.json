@@ -1,0 +1,67 @@
+{
+    "title": "Zillow Agent Scraper",
+    "description": "Scrape real estate agent profiles from Zillow Professionals by URL, agent name, or location.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "url": {
+            "title": "Zillow professionals URL",
+            "type": "string",
+            "description": "A Zillow Professionals search URL, for example https://www.zillow.com/professionals/real-estate-agent-reviews/new-york-ny/.",
+            "editor": "textfield",
+            "prefill": "https://www.zillow.com/professionals/real-estate-agent-reviews/new-york-ny/"
+        },
+        "keyword": {
+            "title": "Agent name or keyword",
+            "type": "string",
+            "description": "Optional agent name or search keyword. This maps to Zillow's name search.",
+            "editor": "textfield",
+            "prefill": "gary"
+        },
+        "location": {
+            "title": "Location",
+            "type": "string",
+            "description": "Location to search when no URL is provided, such as New York, NY, Seattle, WA, Florida, or 90210.",
+            "editor": "textfield",
+            "prefill": "New York, NY"
+        },
+        "results_wanted": {
+            "title": "Results wanted",
+            "type": "integer",
+            "description": "Maximum number of agent records to save.",
+            "minimum": 1,
+            "default": 20,
+            "prefill": 20,
+            "editor": "number"
+        },
+        "max_pages": {
+            "title": "Maximum pages",
+            "type": "integer",
+            "description": "Maximum number of Zillow result pages to request per search.",
+            "minimum": 1,
+            "default": 3,
+            "prefill": 3,
+            "editor": "number"
+        },
+        "collect_details": {
+            "title": "Collect profile details",
+            "type": "boolean",
+            "description": "Open each public Zillow profile to collect extra details such as phone, email, licenses, service areas, and listing counts when available.",
+            "default": false,
+            "prefill": false,
+            "editor": "checkbox"
+        },
+        "proxyConfiguration": {
+            "title": "Proxy configuration",
+            "type": "object",
+            "description": "Use Apify Proxy for larger or cloud runs. Residential proxies are required for reliable scraping of Zillow.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}

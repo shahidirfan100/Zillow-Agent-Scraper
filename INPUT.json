@@ -1,0 +1,12 @@
+{
+    "url": "https://www.zillow.com/professionals/real-estate-agent-reviews/new-york-ny/",
+    "keyword": "gary",
+    "location": "New York, NY",
+    "results_wanted": 20,
+    "max_pages": 3,
+    "collect_details": false,
+    "proxyConfiguration": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+    }
+}

@@ -1,0 +1,244 @@
+{
+    "actorSpecification": 1,
+    "fields": {
+        "encoded_zuid": {
+            "title": "Encoded ZUID",
+            "type": "string",
+            "description": "Zillow encoded professional identifier."
+        },
+        "name": {
+            "title": "Name",
+            "type": "string",
+            "description": "Agent, team, or profile name."
+        },
+        "business_name": {
+            "title": "Business name",
+            "type": "string",
+            "description": "Brokerage, team, or company name."
+        },
+        "profile_url": {
+            "title": "Profile URL",
+            "type": "string",
+            "description": "Direct Zillow profile URL."
+        },
+        "email": {
+            "title": "Email",
+            "type": "string",
+            "description": "Public profile email when available."
+        },
+        "phone_cell": {
+            "title": "Cell phone",
+            "type": "string",
+            "description": "Public cell phone number when available."
+        },
+        "phone_office": {
+            "title": "Office phone",
+            "type": "string",
+            "description": "Public office phone number when available."
+        },
+        "business_address": {
+            "title": "Business address",
+            "type": "string",
+            "description": "Public business address."
+        },
+        "business_city": {
+            "title": "Business city",
+            "type": "string",
+            "description": "Business city."
+        },
+        "business_state": {
+            "title": "Business state",
+            "type": "string",
+            "description": "Business state."
+        },
+        "business_postal_code": {
+            "title": "Postal code",
+            "type": "string",
+            "description": "Business postal code."
+        },
+        "image_url": {
+            "title": "Image",
+            "type": "string",
+            "description": "Profile image URL."
+        },
+        "is_top_agent": {
+            "title": "Top agent",
+            "type": "boolean",
+            "description": "Whether Zillow marks this profile as a top agent."
+        },
+        "review_average": {
+            "title": "Review average",
+            "type": "number",
+            "description": "Average Zillow review rating."
+        },
+        "review_count": {
+            "title": "Review count",
+            "type": "integer",
+            "description": "Number of Zillow reviews."
+        },
+        "team_price_range": {
+            "title": "Price range",
+            "type": "string",
+            "description": "Displayed team or agent price range."
+        },
+        "team_sales_last_12_months": {
+            "title": "Sales last 12 months",
+            "type": "string",
+            "description": "Displayed sales count for the last 12 months."
+        },
+        "team_sales_in_location": {
+            "title": "Sales in location",
+            "type": "string",
+            "description": "Displayed sales count for the searched location."
+        },
+        "tags": {
+            "title": "Tags",
+            "type": "array",
+            "description": "Zillow profile tags such as TEAM."
+        },
+        "specialties": {
+            "title": "Specialties",
+            "type": "array",
+            "description": "Public professional specialties when available."
+        },
+        "languages": {
+            "title": "Languages",
+            "type": "array",
+            "description": "Public languages when available."
+        },
+        "service_areas": {
+            "title": "Service areas",
+            "type": "array",
+            "description": "Public service areas when available."
+        },
+        "agent_licenses": {
+            "title": "Licenses",
+            "type": "array",
+            "description": "Public real estate license records when available."
+        },
+        "for_sale_listing_count": {
+            "title": "For sale listings",
+            "type": "integer",
+            "description": "Count of public for-sale listings on the profile."
+        },
+        "past_sales_count": {
+            "title": "Past sales",
+            "type": "integer",
+            "description": "Count of public past sales on the profile."
+        },
+        "search_location": {
+            "title": "Search location",
+            "type": "string",
+            "description": "Location used for the result page."
+        },
+        "results_found_text": {
+            "title": "Results found",
+            "type": "string",
+            "description": "Displayed Zillow result count label."
+        },
+        "source_url": {
+            "title": "Source URL",
+            "type": "string",
+            "description": "Search page URL used for this result."
+        },
+        "page": {
+            "title": "Page",
+            "type": "integer",
+            "description": "Search result page number."
+        },
+        "scraped_at": {
+            "title": "Scraped at",
+            "type": "string",
+            "description": "ISO timestamp for when the record was saved."
+        }
+    },
+    "views": {
+        "overview": {
+            "title": "Overview",
+            "transformation": {
+                "fields": [
+                    "name",
+                    "business_name",
+                    "profile_url",
+                    "email",
+                    "phone_cell",
+                    "business_address",
+                    "review_average",
+                    "review_count",
+                    "is_top_agent",
+                    "team_price_range",
+                    "team_sales_last_12_months",
+                    "search_location",
+                    "image_url",
+                    "source_url",
+                    "scraped_at"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "name": {
+                        "label": "Name",
+                        "format": "text"
+                    },
+                    "business_name": {
+                        "label": "Business",
+                        "format": "text"
+                    },
+                    "profile_url": {
+                        "label": "Profile",
+                        "format": "link"
+                    },
+                    "email": {
+                        "label": "Email",
+                        "format": "text"
+                    },
+                    "phone_cell": {
+                        "label": "Cell",
+                        "format": "text"
+                    },
+                    "business_address": {
+                        "label": "Address",
+                        "format": "text"
+                    },
+                    "review_average": {
+                        "label": "Rating",
+                        "format": "number"
+                    },
+                    "review_count": {
+                        "label": "Reviews",
+                        "format": "number"
+                    },
+                    "is_top_agent": {
+                        "label": "Top agent",
+                        "format": "boolean"
+                    },
+                    "team_price_range": {
+                        "label": "Price range",
+                        "format": "text"
+                    },
+                    "team_sales_last_12_months": {
+                        "label": "12 mo. sales",
+                        "format": "text"
+                    },
+                    "search_location": {
+                        "label": "Location",
+                        "format": "text"
+                    },
+                    "image_url": {
+                        "label": "Image",
+                        "format": "image"
+                    },
+                    "source_url": {
+                        "label": "Source",
+                        "format": "link"
+                    },
+                    "scraped_at": {
+                        "label": "Scraped",
+                        "format": "date"
+                    }
+                }
+            }
+        }
+    }
+}
