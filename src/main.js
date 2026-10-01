@@ -8,15 +8,29 @@ const ZILLOW_BASE_URL = 'https://www.zillow.com';
 const AGENT_SEARCH_PATH = '/professionals/real-estate-agent-reviews/';
 const TRACKER_RE =
     /google-analytics|googletagmanager|doubleclick|bat\.bing|scorecardresearch|adscores|kargo|amazon-adsystem|facebook\.com\/tr/i;
+const CHALLENGE_RE =
+    /Access to this page has been denied|px-captcha|Pardon Our Interruption|unusual traffic|verify you are human|Access Denied|PerimeterX|pxchallenge/i;
+
+const IMPIT_BROWSER_PROFILES = [
+    'chrome151',
+    'chrome142',
+    'firefox144',
+    'okhttp5',
+    'okhttp4',
+    'okhttp3',
+    'okhttp',
+    'ios18',
+];
 
 const MAX_SESSION_ROTATIONS = 2;
-// Profile pages are optional enrichment. Keep a challenged detail request from
-// holding the whole result set open, especially with residential proxies.
-const DETAIL_CONCURRENCY = 4;
+const IMPIT_PAGE_ATTEMPTS = 4;
+const IMPIT_SEARCH_TIMEOUT_MS = 25000;
+const DETAIL_CONCURRENCY = 8;
+const PROFILE_MAX_ATTEMPTS = 2;
 const HYDRATION_WAIT_MS = 9000;
 const HYDRATION_POLL_MS = 500;
 const HTTP_FALLBACK_TIMEOUT_MS = 20000;
-const PROFILE_HTTP_TIMEOUT_MS = 5000;
+const PROFILE_HTTP_TIMEOUT_MS = 12000;
 
 const sleep = (ms) =>
     new Promise((resolve) => {
@@ -126,10 +140,10 @@ class StealthBrowser {
     async fetch(url, options = {}, targetPage = this.page) {
         const state = await this.goto(url, options, targetPage);
         if (state.blocked) {
-            throw new Error(`Zillow blocked the browser request for ${url}`);
+            throw new Error(`Zillow blocked the request for ${url}`);
         }
         if (!state.hasJson) {
-            throw new Error(`Browser found no Zillow JSON payload for ${url} (title: ${state.title || 'unknown'})`);
+            throw new Error(`No Zillow JSON payload for ${url} (title: ${state.title || 'unknown'})`);
         }
         return state.jsonText;
     }
@@ -258,7 +272,7 @@ function parsePayload(payloadText, sourceUrl) {
 }
 
 function extractNextDataFromHtml(html, sourceUrl) {
-    const match = String(html || '').match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    const match = String(html || '').match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
     if (!match?.[1]) throw new Error(`HTTP response had no Zillow JSON payload for ${sourceUrl}`);
     return match[1];
 }
@@ -302,12 +316,12 @@ async function fetchHydrationOverHttp(url, options = {}) {
             });
             const html = await response.text();
             if (response.ok && html.includes('__NEXT_DATA__')) {
-                log.info(`HTTP hydration fallback returned Zillow JSON with ${profile.name}.`);
+                log.debug('HTTP recovery request returned Zillow data.');
                 return extractNextDataFromHtml(html, url);
             }
-            log.debug(`HTTP hydration fallback ${profile.name} returned ${response.status} without Zillow JSON.`);
+            log.debug(`HTTP recovery request returned ${response.status} without Zillow data.`);
         } catch (error) {
-            log.debug(`HTTP hydration fallback ${profile.name} failed: ${error.message}`);
+            log.debug(`HTTP recovery request failed: ${error.message}`);
         } finally {
             clearTimeout(timeout);
         }
@@ -315,33 +329,92 @@ async function fetchHydrationOverHttp(url, options = {}) {
     throw new Error(`HTTP hydration fallback failed for ${url}`);
 }
 
-async function fetchProfileHydrationWithImpit(client, url) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), PROFILE_HTTP_TIMEOUT_MS);
-    try {
-        const response = await client.fetch(url, { redirect: 'follow', signal: controller.signal });
-        if (!response.ok) throw new Error(`Impit returned HTTP ${response.status} for ${url}`);
-        return extractNextDataFromHtml(await response.text(), url);
-    } finally {
-        clearTimeout(timeout);
-    }
+function parseRetryAfter(value) {
+    if (!value) return undefined;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds)) return Math.min(Math.max(seconds, 0) * 1000, 15000);
+    const date = Date.parse(value);
+    if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 0), 15000);
+    return undefined;
 }
 
-function createImpitClient(proxyUrl) {
+function createImpitClient(proxyUrl, browser = IMPIT_BROWSER_PROFILES[0]) {
     return new Impit({
-        browser: 'chrome',
+        browser,
         ignoreTlsErrors: true,
         ...(proxyUrl ? { proxyUrl } : {}),
     });
 }
 
-async function createProfileClientPool(proxyConfiguration, size) {
-    const clients = [];
-    for (let index = 0; index < size; index++) {
-        const proxyUrl = proxyConfiguration ? await getProxyUrl(proxyConfiguration) : undefined;
-        clients.push(createImpitClient(proxyUrl));
+async function fetchHydrationWithImpit(client, url, timeoutMs = IMPIT_SEARCH_TIMEOUT_MS) {
+    const response = await client.fetch(url, { redirect: 'follow', timeout: timeoutMs });
+    const body = await response.text();
+    try {
+        return extractNextDataFromHtml(body, url);
+    } catch (error) {
+        const challenged =
+            response.status === 403 ||
+            response.status === 429 ||
+            response.status >= 500 ||
+            CHALLENGE_RE.test(body);
+        if (!challenged) throw error;
+        const wrapped = new Error(`Impit HTTP ${response.status} challenge`);
+        wrapped.status = response.status;
+        wrapped.retryAfter = parseRetryAfter(response.headers.get('retry-after'));
+        throw wrapped;
     }
-    return clients;
+}
+
+async function createClientPool(proxyConfiguration, size) {
+    const slots = [];
+    for (let index = 0; index < size; index++) {
+        const browser = IMPIT_BROWSER_PROFILES[index % IMPIT_BROWSER_PROFILES.length];
+        const proxyUrl = proxyConfiguration ? await getProxyUrl(proxyConfiguration) : undefined;
+        slots.push({ browser, client: createImpitClient(proxyUrl, browser) });
+    }
+    return { proxyConfiguration, slots, cursor: 0 };
+}
+
+async function refreshClientSlot(pool, slot) {
+    const target = slot;
+    if (!pool.proxyConfiguration) return;
+    const proxyUrl = await getProxyUrl(pool.proxyConfiguration);
+    if (proxyUrl) target.client = createImpitClient(proxyUrl, target.browser);
+}
+
+async function nextHydrationSlot(pool) {
+    const state = pool;
+    if (state.cursor >= state.slots.length) {
+        state.cursor = 0;
+        if (state.proxyConfiguration) {
+            for (const slot of state.slots) await refreshClientSlot(state, slot);
+            log.debug('Rotated Zillow HTTP sessions to fresh proxy identities.');
+        }
+    }
+    const slot = state.slots[state.cursor];
+    state.cursor += 1;
+    return slot;
+}
+
+async function fetchHydrationWithImpitPool(pool, url, options = {}) {
+    const maxAttempts = options.attempts ?? IMPIT_PAGE_ATTEMPTS;
+    const timeoutMs = options.timeoutMs ?? IMPIT_SEARCH_TIMEOUT_MS;
+    let lastError;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const slot = await nextHydrationSlot(pool);
+        try {
+            const jsonText = await fetchHydrationWithImpit(slot.client, url, timeoutMs);
+            return { jsonText };
+        } catch (error) {
+            lastError = error;
+            log.warning(`Page fetch attempt ${attempt}/${maxAttempts} failed for ${url}: ${error.message}`);
+            if (attempt < maxAttempts) {
+                const delay = error.retryAfter ?? Math.min(600 * 2 ** (attempt - 1), 5000);
+                await sleep(delay + Math.round(Math.random() * 500));
+            }
+        }
+    }
+    throw lastError ?? new Error(`Zillow HTTP hydration failed for ${url}`);
 }
 
 function getSearchResults(nextData) {
@@ -537,9 +610,9 @@ async function launchBrowser(proxyUrl) {
 async function warmupBrowser(browser) {
     try {
         await browser.warmup();
-        log.info('Browser warmup on Zillow homepage completed.');
+        log.debug('Session warmup completed.');
     } catch (error) {
-        log.warning(`Browser warmup did not complete: ${error.message}`);
+        log.debug(`Session warmup did not complete: ${error.message}`);
     }
 }
 
@@ -558,7 +631,7 @@ async function fetchWithRetry(browser, url, proxyConfiguration, rotations, label
             let proxyUrl;
             if (proxyConfiguration && !directAttempted) {
                 directAttempted = true;
-                log.warning(`${label} switching to a direct browser session after the proxy session was challenged.`);
+                log.warning(`${label} retrying with a fresh session after the proxy identity was challenged.`);
             } else {
                 proxyUrl = await getProxyUrl(proxyConfiguration);
             }
@@ -571,30 +644,24 @@ async function fetchWithRetry(browser, url, proxyConfiguration, rotations, label
     throw new Error(`Could not fetch ${url} after ${rotations} rotations.`);
 }
 
-async function fetchProfileDetails(browser, profileUrl, profileClients, primaryClientIndex) {
-    if (!profileUrl) return { browser, details: {}, failed: false };
+async function fetchProfileDetails(pool, slotIndex, profileUrl) {
+    if (!profileUrl) return { details: {}, failed: false };
 
-    const clientCount = profileClients.length;
-    const clientIndexes = Array.from({ length: clientCount }, (_, offset) =>
-        (primaryClientIndex + offset) % clientCount,
-    );
-    for (const clientIndex of clientIndexes) {
+    const slot = pool.slots[slotIndex % pool.slots.length];
+    for (let attempt = 1; attempt <= PROFILE_MAX_ATTEMPTS; attempt++) {
         try {
-            const jsonText = await fetchProfileHydrationWithImpit(profileClients[clientIndex], profileUrl);
-            return {
-                browser,
-                failed: false,
-                details: mapProfileDetails(parsePayload(jsonText, profileUrl)),
-            };
-        } catch {
-            // Try the next already-created session without creating a client per request.
+            const jsonText = await fetchHydrationWithImpit(slot.client, profileUrl, PROFILE_HTTP_TIMEOUT_MS);
+            return { details: mapProfileDetails(parsePayload(jsonText, profileUrl)), failed: false };
+        } catch (error) {
+            log.debug(`Profile detail attempt ${attempt}/${PROFILE_MAX_ATTEMPTS} failed: ${error.message}`);
+            if (attempt < PROFILE_MAX_ATTEMPTS) await refreshClientSlot(pool, slot);
         }
     }
 
-    return { browser, details: {}, failed: true };
+    return { details: {}, failed: true };
 }
 
-async function enrichProfilesInParallel(browser, pendingProfiles, profileClients, concurrency) {
+async function enrichProfilesInParallel(pool, pendingProfiles, concurrency) {
     const workerCount = Math.min(concurrency, pendingProfiles.length);
     const results = new Array(pendingProfiles.length);
     let nextIndex = 0;
@@ -606,12 +673,7 @@ async function enrichProfilesInParallel(browser, pendingProfiles, profileClients
             if (index >= pendingProfiles.length) return;
 
             const pending = pendingProfiles[index];
-            const detailResult = await fetchProfileDetails(
-                browser,
-                pending.profileUrl,
-                profileClients,
-                workerIndex,
-            );
+            const detailResult = await fetchProfileDetails(pool, workerIndex, pending.profileUrl);
             results[index] = { ...pending, ...detailResult };
         }
     };
@@ -637,7 +699,6 @@ async function main() {
 
     const proxyConfiguration = await createProxyConfiguration(input.proxyConfiguration);
     const proxyUrl = await getProxyUrl(proxyConfiguration);
-    const profileClient = createImpitClient();
 
     if (proxyConfiguration && !proxyUrl) {
         log.error(
@@ -646,8 +707,16 @@ async function main() {
         throw new Error('Proxy configuration failed: could not create a proxy URL.');
     }
 
-    let browser = await launchBrowser(proxyUrl);
-    await warmupBrowser(browser);
+    const hydrationPool = await createClientPool(proxyConfiguration, IMPIT_BROWSER_PROFILES.length);
+    let detailPool = null;
+    let browser = null;
+    const ensureBrowser = async () => {
+        if (!browser) {
+            browser = await launchBrowser(proxyUrl);
+            await warmupBrowser(browser);
+        }
+        return browser;
+    };
 
     const seen = new Set();
     let saved = 0;
@@ -666,27 +735,32 @@ async function main() {
             const sourceUrl = buildSearchUrl({ baseUrl, location, keyword, page });
             let nextData;
             try {
-                const result = await fetchWithRetry(
-                    browser,
-                    sourceUrl,
-                    proxyConfiguration,
-                    MAX_SESSION_ROTATIONS,
-                    'Search fetch',
-                );
-                browser = result.browser;
+                const result = await fetchHydrationWithImpitPool(hydrationPool, sourceUrl, {
+                    attempts: IMPIT_PAGE_ATTEMPTS,
+                    timeoutMs: IMPIT_SEARCH_TIMEOUT_MS,
+                });
                 nextData = parsePayload(result.jsonText, sourceUrl);
-            } catch (error) {
+                log.debug(`Fetched Zillow page ${page}.`);
+            } catch (httpError) {
                 try {
                     const fallbackPayload = await fetchHydrationOverHttp(sourceUrl);
                     nextData = parsePayload(fallbackPayload, sourceUrl);
-                    log.info(`Using HTTP hydration fallback for page ${page}.`);
+                    log.debug(`Used the HTTP recovery path for page ${page}.`);
                 } catch (fallbackError) {
                     try {
-                        const impitPayload = await fetchProfileHydrationWithImpit(profileClient, sourceUrl);
-                        nextData = parsePayload(impitPayload, sourceUrl);
-                        log.info(`Using Impit hydration fallback for page ${page}.`);
-                    } catch (impitError) {
-                        const combinedError = `${error.message}; ${fallbackError.message}; ${impitError.message}`;
+                        const activeBrowser = await ensureBrowser();
+                        const result = await fetchWithRetry(
+                            activeBrowser,
+                            sourceUrl,
+                            proxyConfiguration,
+                            MAX_SESSION_ROTATIONS,
+                            'Search fetch',
+                        );
+                        browser = result.browser;
+                        nextData = parsePayload(result.jsonText, sourceUrl);
+                        log.debug(`Used the recovery session for page ${page}.`);
+                    } catch (browserError) {
+                        const combinedError = `${httpError.message}; ${fallbackError.message}; ${browserError.message}`;
                         if (saved > 0) {
                             stopReason = `stopped at page ${page}: ${combinedError}`;
                             log.warning(stopReason);
@@ -704,7 +778,7 @@ async function main() {
             if (!cards.length) {
                 consecutiveEmptyPages += 1;
                 stopReason = `no agent cards on page ${page}`;
-                log.info(`No agent cards returned for ${sourceUrl}`);
+                log.debug(`No agent cards returned for page ${page}.`);
                 if (consecutiveEmptyPages >= 2) break;
                 continue;
             }
@@ -735,17 +809,8 @@ async function main() {
             }
 
             if (collectDetails && pendingProfiles.length) {
-                const profileClients = await createProfileClientPool(
-                    proxyConfiguration,
-                    Math.min(DETAIL_CONCURRENCY, pendingProfiles.length),
-                );
-                profileClients.push(profileClient);
-                const detailBatch = await enrichProfilesInParallel(
-                    browser,
-                    pendingProfiles,
-                    profileClients,
-                    DETAIL_CONCURRENCY,
-                );
+                detailPool ??= await createClientPool(proxyConfiguration, DETAIL_CONCURRENCY);
+                const detailBatch = await enrichProfilesInParallel(detailPool, pendingProfiles, DETAIL_CONCURRENCY);
                 for (const item of detailBatch.results) {
                     if (item.failed) profileDetailsUnavailable += 1;
                     else profileDetailsFetched += 1;
@@ -760,7 +825,7 @@ async function main() {
                 saved += batch.length;
                 log.info(`Saved ${batch.length} agents from page ${page}. Total: ${saved}/${resultsWanted}`);
             } else {
-                log.info(`Page ${page} contained only duplicate agents.`);
+                log.debug(`Page ${page} contained only duplicate agents.`);
             }
 
             const totalFound = Number(searchResults?.resultsFound);

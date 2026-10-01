@@ -54,3 +54,37 @@ Two current third-party Apify listings describe additional names, but neither pu
 - `sian.agency/zillow-agent-scraper` describes `/agent/search` pagination and `/agent/details` enrichment, but those paths are product descriptions rather than verified Zillow endpoints.
 
 The first cloud run reached Zillow but stayed on the verification page for every proxy session and returned no `__NEXT_DATA__`. The implementation now limits browser hydration polling to 12 seconds, shortens warmup, switches from the injected residential proxy to a direct browser session after the first challenge, and validates iOS Safari and Android hydration requests as a final HTTP fallback. This prevents a blocked cloud session from consuming the full run window while retaining the richer structured source when any delivery path succeeds.
+
+### Impit browser-profile validation (live probe)
+
+Every profile exposed by the installed `impit` (0.14.x) was requested against
+`https://www.zillow.com/professionals/real-estate-agent-reviews/new-york-ny/` and checked for
+`script#__NEXT_DATA__` plus 15 `AgentDirectoryFinderProfileResultsCard` entries and
+`resultsFound=70553`. Requests were issued one at a time from a single residential-quality IP.
+
+| Impit profile | Status | Payload | Cards | Decision |
+| --- | ---: | --- | ---: | --- |
+| `chrome` (default) | 403 | none | 0 | Blocked |
+| `chrome100`-`chrome136` | 403 | none | 0 | Blocked |
+| `chrome142` | 200 | `__NEXT_DATA__` | 15 | Selected |
+| `chrome151` | 200 | `__NEXT_DATA__` | 15 | Selected |
+| `firefox` / `firefox128` / `firefox133` / `firefox135` | 403 | none | 0 | Blocked |
+| `firefox144` | 200 | `__NEXT_DATA__` | 15 | Selected |
+| `okhttp` / `okhttp3` / `okhttp4` / `okhttp5` | 200 | `__NEXT_DATA__` | 15 | Selected |
+| `ios18` | 200 | `__NEXT_DATA__` | 15 | Selected |
+
+Two consecutive full passes returned the payload for every selected profile. A third pass
+returned `403` for all profiles, which shows the block is applied to the source IP after a
+burst of direct requests rather than to a specific fingerprint. The runtime therefore rotates
+`chrome151`, `chrome142`, `firefox144`, `okhttp5`, `okhttp4`, `okhttp3`, `okhttp`, and `ios18`,
+and issues each attempt through a fresh proxy identity. When all profile slots have been used
+once, the pool rebuilds every slot with a new proxy session. `impit` is pinned to `^0.14.5`
+because `chrome151` is only present in that release and later.
+
+### Delivery priority update
+
+The live evidence changes the delivery order. A clean HTTP request with a current profile
+returns the same structured payload as the browser without the verification-page stall seen in
+the first cloud run. The actor now tries the rotating HTTP profile pool first, then the native
+iOS/Android header fallback, and only launches Patchright Chrome when both HTTP paths fail.
+The browser path is unchanged and remains the final recovery layer.
